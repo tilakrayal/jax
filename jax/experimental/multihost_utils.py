@@ -71,7 +71,12 @@ def broadcast_one_to_all(in_tree: Any, is_source: bool | None = None) -> Any:
     else:
       inp = np.zeros_like(x)
     inp = np.expand_dims(inp, axis=0)
-    return host_local_array_to_global_array(inp, global_mesh, pspec)
+    out = host_local_array_to_global_array(inp, global_mesh, pspec)
+    assert out.sharding.is_equivalent_to(
+        jax.sharding.NamedSharding(global_mesh, pspec), out.ndim
+    )
+    print('OUTPUT SHARDING****', out.sharding)
+    return out
 
   def post_jit(x):
     return np.asarray(x.addressable_data(0))
@@ -336,48 +341,22 @@ def host_local_array_to_global_array(
   Returns:
     A pytree of global arrays.
   """
+  def make_array(inp, in_spec):
+    out_sharding = jax.sharding.NamedSharding(global_mesh, in_spec)
+    if isinstance(inp, array.ArrayImpl) and not inp.is_fully_addressable:
+      return jax.jit(lambda x: x, out_shardings=out_sharding)(inp)
+    return jax.make_array_from_process_local_data(
+        sharding=out_sharding,
+        local_data=inp)
+
+  # jax.make_array_from_process_local_data()
   flat_inps, in_tree = tree_flatten(local_inputs)
   in_pspecs = _flatten_pspecs('input pspecs', in_tree,
                               pjit_lib.hashable_pytree(pspecs))
   out_flat = [
-      host_local_array_to_global_array_p.bind(inp, global_mesh=global_mesh,
-                                              pspec=in_spec)
-      for inp, in_spec in safe_zip(flat_inps, in_pspecs)
+      make_array(inp, pspec) for inp, pspec in safe_zip(flat_inps, in_pspecs)
   ]
   return tree_unflatten(in_tree, out_flat)
-
-host_local_array_to_global_array_p = core.Primitive('host_local_array_to_global_array')
-host_local_array_to_global_array_p.def_impl(host_local_array_to_global_array_impl)
-
-def ltg_abstract_eval(arr, *, global_mesh, pspec):
-  return _local_to_global_aval(
-      core.ShapedArray(arr.shape, arr.dtype), global_mesh, pspec)
-host_local_array_to_global_array_p.def_abstract_eval(ltg_abstract_eval)
-
-ad.deflinear2(host_local_array_to_global_array_p,
-              lambda ct, _, **params: (
-                  host_local_array_to_global_array_p.bind(ct, **params),))
-
-def ltg_batcher(insert_axis, spmd_axis_name, axis_size,
-                axis_name, main_type, vals_in, dims_in,
-                global_mesh, pspec):
-  x, = vals_in
-  d, = dims_in
-  new_parts = None if spmd_axis_name is None else spmd_axis_name
-  new_pspec = list(pspec)
-  new_pspec.insert(d, new_parts)
-  new_pspec = P(*new_pspec)
-  y = host_local_array_to_global_array_p.bind(
-      x, global_mesh=global_mesh, pspec=new_pspec)
-  return y, d
-batching.spmd_axis_primitive_batchers[host_local_array_to_global_array_p] = partial(
-    ltg_batcher, False)
-batching.axis_primitive_batchers[host_local_array_to_global_array_p] = partial(
-    ltg_batcher, False, None)
-
-def _ltg_lowering(ctx, x, *, global_mesh, pspec):
-  return [x]
-mlir.register_lowering(host_local_array_to_global_array_p, _ltg_lowering)
 
 
 def global_array_to_host_local_array_impl(
