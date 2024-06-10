@@ -22,6 +22,7 @@ import functools
 from functools import partial
 import io
 import itertools
+import logging
 import operator
 import os
 import re
@@ -694,6 +695,7 @@ class LoweringRuleContext:
   # Override module_context.platforms if not None. Used during multi-platform
   # lowering, when in a scope with a subset of the module_context.platforms.
   platforms: Sequence[str] | None = None
+  attributes: core.Attributes | None = None
 
   def set_tokens_out(self, tokens_out: TokenSet):
     assert self.tokens_out is None, 'Should only set `tokens_out` once.'
@@ -1583,7 +1585,8 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
           avals_in=avals_in,
           avals_out=map(aval, eqn.outvars), tokens_in=tokens_in,
           tokens_out=None, dim_var_values=dim_var_values,
-          compute_type=compute_type)
+          compute_type=compute_type,
+          attributes=eqn.ctx.attributes)
       if config.dynamic_shapes.value:
         axis_size_env = {d: read(d)[0]
                          for a in avals_in if type(a) is core.DShapedArray
@@ -1703,6 +1706,8 @@ def lower_per_platform(ctx: LoweringRuleContext,
     wrapped_out = map(wrap_singleton_ir_values, output)
     map(lambda o: wrap_compute_type_in_place(ctx, o.owner),
         util.flatten(wrapped_out))
+    map(lambda o: wrap_attributes_in_place(ctx, o.owner),
+        util.flatten(wrapped_out))
     return output
 
   assert len(platforms) > 1 and len(kept_rules) >= 2, (platforms, kept_rules)
@@ -1741,6 +1746,8 @@ def lower_per_platform(ctx: LoweringRuleContext,
         raise ValueError("Output of translation rule must be iterable: "
                         f"{description}, got output {output}") from e
       map(lambda o: wrap_compute_type_in_place(ctx, o.owner),
+          util.flatten(out_nodes))
+      map(lambda o: wrap_attributes_in_place(ctx, o.owner),
           util.flatten(out_nodes))
       if inner_ctx.tokens_out is not None:
         assert len(ordered_effects) == len(inner_ctx.tokens_out)
@@ -1897,8 +1904,17 @@ def wrap_compute_type_in_place(ctx, op):
   if ctx.compute_type is not None:
     dict_attr = {"_xla_compute_type": ir.StringAttr.get(
         map_compute_type(ctx.compute_type))}
+    print("DEBUG in compute type: ", op)
     op.operation.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(dict_attr)
 
+def wrap_attributes_in_place(ctx, op):
+  ctx_attributes = {}
+  if ctx.attributes is not None:
+    for k, v in ctx.attributes.items():
+      ctx_attributes[k] = ir.StringAttr.get(v)
+    print("DEBUG: ", op)
+    if isinstance(op, ir.Operation):
+      op.attributes["mhlo.frontend_attributes"] = ir.DictAttr.get(ctx_attributes)
 
 def broadcast_in_dim(ctx: LoweringRuleContext, op, aval_out: core.AbstractValue, *,
                      broadcast_dimensions) -> ir.Value:
